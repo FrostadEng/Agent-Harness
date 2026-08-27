@@ -1,19 +1,92 @@
-#!/bin/sh
-set -eu
-usage() { echo "usage: agent-harness --repo PATH --task TEXT [--branch NAME] [--output PATH]"; }
-repo= task= branch="agent-harness/$(date +%Y%m%d-%H%M%S)" output=
-while [ $# -gt 0 ]; do
-  case "$1" in --repo) repo=$2; shift 2;; --task) task=$2; shift 2;; --branch) branch=$2; shift 2;; --output) output=$2; shift 2;; --help|-h) usage; exit 0;; *) usage >&2; exit 2;; esac
-done
-[ -n "$repo" ] && [ -n "$task" ] || { usage >&2; exit 2; }
-repo=$(cd "$repo" && pwd); output=${output:-"$repo/.agent-harness-runs/$(date +%s)"}
-mkdir -p "$output"; worktree="$output/worktree"
-git clone --quiet --no-local "$repo" "$worktree"
-git -C "$worktree" checkout -q -b "$branch"
-image=${AGENT_HARNESS_IMAGE:-agent-harness:local}
-docker build -t "$image" "$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
-docker run --rm -i \
-  -e OPENAI_API_KEY -e CODEX_API_KEY -e HARNESS_IMAGE="$image" \
-  -v "$worktree:/workspace" -v "$output:/output" \
-  "$image" --task "$task"
-printf '%s\n' "$worktree"
+#!/usr/bin/env python3
+"""Trusted host launcher: Git, verification, and publication authority stay here."""
+import argparse, json, os, pathlib, shlex, shutil, subprocess, sys, tempfile, time, tomllib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+def command(argv, **kw):
+    print("+ " + shlex.join(map(str, argv)), file=sys.stderr)
+    return subprocess.run(list(map(str, argv)), check=True, **kw)
+
+def git(repo, *args):
+    return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
+
+def main():
+    p=argparse.ArgumentParser(description="Run Codex with host-owned Git and verification authority")
+    p.add_argument("--repo",required=True); p.add_argument("--task",required=True)
+    p.add_argument("--branch",default=f"agent-harness/{int(time.time())}")
+    p.add_argument("--output"); p.add_argument("--image",default=os.getenv("AGENT_HARNESS_IMAGE","agent-harness:local"))
+    p.add_argument("--codex-home",help="authenticated host CODEX_HOME (default: $CODEX_HOME or ~/.codex)")
+    p.add_argument("--no-build",action="store_true"); a=p.parse_args()
+    repo=pathlib.Path(a.repo).resolve(); base=git(repo,"rev-parse","HEAD")
+    cfg=tomllib.loads((repo/".agent-harness.toml").read_text()); budget=cfg.get("budget",{})
+    if int(budget.get("max_model_turns",1)) < 1: raise SystemExit("STOP_BUDGET_EXCEEDED: max_model_turns")
+    wall=int(budget.get("wall_seconds",1800))
+    output=pathlib.Path(a.output).resolve() if a.output else pathlib.Path(tempfile.mkdtemp(prefix="agent-harness-"))
+    output.mkdir(parents=True,exist_ok=True); worktree=output/"worktree"
+    command(["git","-C",repo,"worktree","add","-b",a.branch,worktree,base])
+    os.chmod(output,0o777)
+    if not a.no_build: command(["docker","build","-t",a.image,ROOT])
+    digest=subprocess.check_output(["docker","image","inspect",a.image,"--format={{.Id}}"],text=True).strip()
+    source_home=pathlib.Path(a.codex_home or os.getenv("CODEX_HOME",pathlib.Path.home()/".codex")).expanduser().resolve()
+    status=subprocess.run(["codex","login","status"],env={**os.environ,"CODEX_HOME":str(source_home)},text=True,capture_output=True)
+    if status.returncode or "chatgpt" not in (status.stdout+status.stderr).lower():
+        raise SystemExit(f"host CODEX_HOME is not ChatGPT-authenticated: {status.stdout}{status.stderr}".strip())
+    # Codex 0.150 documents file-backed cached login as CODEX_HOME/auth.json.
+    # Validate the staged home with this installed CLI rather than trusting a copy.
+    auth_file=source_home/"auth.json"
+    if not auth_file.is_file():
+        raise SystemExit("ChatGPT login is not file-backed; run: codex -c cli_auth_credentials_store=file login")
+    auth_root=pathlib.Path(tempfile.mkdtemp(prefix="agent-harness-auth-")); os.chmod(auth_root,0o700)
+    staged_home=auth_root/"codex-home"; staged_home.mkdir(mode=0o700)
+    shutil.copyfile(auth_file,staged_home/"auth.json"); os.chmod(staged_home/"auth.json",0o600)
+    (staged_home/"config.toml").write_text(
+        'cli_auth_credentials_store = "file"\nforced_login_method = "chatgpt"\n'
+        'default_permissions = "harness"\n\n[permissions.harness]\nextends = ":workspace"\n\n'
+        '[permissions.harness.filesystem]\n"/run/codex-home" = "deny"\n')
+    staged_status=subprocess.run(["codex","login","status"],env={**os.environ,"CODEX_HOME":str(staged_home)},text=True,capture_output=True)
+    if staged_status.returncode or "chatgpt" not in (staged_status.stdout+staged_status.stderr).lower():
+        shutil.rmtree(auth_root); raise SystemExit("staged Codex home failed ChatGPT login validation")
+    runid=f"ah-{os.getpid()}-{int(time.time())}"; network=runid; proxy=runid+"-proxy"
+    # An internal network gives the agent no external route. Only the dual-homed,
+    # allowlisting CONNECT proxy can reach the Internet.
+    try: command(["docker","network","create","--internal",network],stdout=subprocess.DEVNULL)
+    except Exception:
+        shutil.rmtree(auth_root); raise
+    # A linked worktree's .git file points at controller-owned metadata. Remove it
+    # for the agent lifetime, then restore it before trusted Git operations.
+    git_pointer=(worktree/".git").read_text(); (worktree/".git").unlink(); (worktree/".git").mkdir()
+    try:
+        command(["docker","run","-d","--rm","--name",proxy,"--network",network,
+                 "--read-only","--cap-drop=ALL","--security-opt=no-new-privileges",
+                 "--tmpfs","/tmp:rw,nosuid,nodev,noexec,size=16m",
+                 "-e","CODEX_CONTROL_PLANE_HOSTS=chatgpt.com,openai.com",a.image,"proxy"],stdout=subprocess.DEVNULL)
+        command(["docker","network","connect","bridge",proxy])
+        agent_result=output/"agent-result.json"
+        agent_name=runid+"-agent"
+        docker=["docker","run","-i","--name",agent_name,"--network",network,"--read-only","--cap-drop=ALL",
+          "--security-opt=no-new-privileges","--pids-limit=256","--memory=2g","--cpus=2",
+          "--tmpfs","/tmp:rw,nosuid,nodev,size=256m","--tmpfs","/home/codex:rw,nosuid,nodev,size=64m",
+          "--mount",f"type=bind,src={worktree},dst=/workspace,rw",
+          "--user",f"{os.getuid()}:{os.getgid()}","--mount",f"type=bind,src={staged_home},dst=/run/codex-home,rw",
+          "-e","HOME=/home/codex","-e",f"HTTPS_PROXY=http://{proxy}:8080","-e",f"HTTP_PROXY=http://{proxy}:8080",
+          "-e","NO_PROXY=localhost,127.0.0.1","-e","CODEX_HOME=/run/codex-home",a.image,"agent","--task",a.task]
+        agent_started=time.monotonic()
+        try: rc=subprocess.run(docker,timeout=wall).returncode
+        except subprocess.TimeoutExpired:
+            subprocess.run(["docker","kill",agent_name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); rc=124
+        inspected=subprocess.run(["docker","inspect",agent_name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0
+        subprocess.run(["docker","rm","-f",agent_name],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        agent_result.write_text(json.dumps({"exit_code":rc,"container_started":inspected,"codex_executed":inspected,
+          "authentication_mode":"chatgpt-account","duration_seconds":round(time.monotonic()-agent_started,3),"timed_out":rc==124}))
+    finally:
+        subprocess.run(["docker","rm","-f",proxy],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        subprocess.run(["docker","network","rm",network],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        shutil.rmtree(worktree/".git"); (worktree/".git").write_text(git_pointer)
+        shutil.rmtree(auth_root)
+    final=[sys.executable,ROOT/"harness/controller.py","--repo",worktree,"--receipt",output/"receipt.json",
+           "--task",a.task,"--base",base,"--branch",a.branch,"--agent-result",agent_result,
+           "--image",a.image,"--image-digest",digest]
+    result=subprocess.run(list(map(str,final)))
+    print(worktree); return result.returncode
+if __name__=="__main__": sys.exit(main())
