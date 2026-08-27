@@ -1,0 +1,14 @@
+[verification]
+fast = ["python3 -m unittest -q"]
+terminal = ["git diff --check", "python3 app.py | grep -qx 4"]
+
+[policy]
+network = "DENY"
+push = "REQUIRE_HUMAN"
+
+[budget]
+wall_seconds = 300
+max_model_turns = 1
+max_product_commits = 1
+max_changed_files = 2
+max_diff_lines = 20

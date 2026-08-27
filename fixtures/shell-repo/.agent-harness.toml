@@ -1,0 +1,13 @@
+[verification]
+fast = ["sh test.sh"]
+terminal = ["git diff --check", "test \"$(sh greet.sh)\" = 'hello world'"]
+
+[policy]
+network = "DENY"
+
+[budget]
+wall_seconds = 300
+max_model_turns = 1
+max_product_commits = 1
+max_changed_files = 2
+max_diff_lines = 20

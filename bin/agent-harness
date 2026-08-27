@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+usage() { echo "usage: agent-harness --repo PATH --task TEXT [--branch NAME] [--output PATH]"; }
+repo= task= branch="agent-harness/$(date +%Y%m%d-%H%M%S)" output=
+while [ $# -gt 0 ]; do
+  case "$1" in --repo) repo=$2; shift 2;; --task) task=$2; shift 2;; --branch) branch=$2; shift 2;; --output) output=$2; shift 2;; --help|-h) usage; exit 0;; *) usage >&2; exit 2;; esac
+done
+[ -n "$repo" ] && [ -n "$task" ] || { usage >&2; exit 2; }
+repo=$(cd "$repo" && pwd); output=${output:-"$repo/.agent-harness-runs/$(date +%s)"}
+mkdir -p "$output"; worktree="$output/worktree"
+git clone --quiet --no-local "$repo" "$worktree"
+git -C "$worktree" checkout -q -b "$branch"
+image=${AGENT_HARNESS_IMAGE:-agent-harness:local}
+docker build -t "$image" "$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)"
+docker run --rm -i \
+  -e OPENAI_API_KEY -e CODEX_API_KEY -e HARNESS_IMAGE="$image" \
+  -v "$worktree:/workspace" -v "$output:/output" \
+  "$image" --task "$task"
+printf '%s\n' "$worktree"
