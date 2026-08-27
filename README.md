@@ -1,19 +1,56 @@
 # Portable Codex Harness
 
-A deliberately small, single-agent walking skeleton: clone a Git repository into an isolated working tree, run one bounded Codex invocation in Docker, execute that repository's checks, commit a successful result, and emit JSON evidence. Git is the source-control authority and GitHub issues/PRs remain the work-state authority. There is no task database.
+A small trusted controller that gives one Codex container writable task files, but
+not Git metadata, publication credentials, project secrets, host files, Docker, or
+direct Internet access. Git remains source-control authority; this is deliberately
+not a task database, multi-agent framework, memory system, or language toolchain.
 
-It is **not** a multi-agent orchestrator, memory/semantic-graph product, autonomous review loop, or project-specific framework. Docker is the only v1 isolation backend.
+## Authority model
 
-## Run it
+The host launcher records the exact base, creates one branch with `git worktree`,
+and temporarily hides the linked worktree's `.git` pointer while the agent runs.
+The container has a read-only root, dropped capabilities, `no-new-privileges`,
+bounded resources, explicit tmpfs paths, and only the task worktree and staged-auth mounts.
+It receives a temporary ChatGPT-account-authenticated Codex home at runtime but no
+GitHub/project credentials. Codex control-plane authentication is runtime identity,
+not a project secret; workload secrets remain unavailable by default.
 
-Requirements are Git, Docker, and an `OPENAI_API_KEY` or `CODEX_API_KEY` in the environment. Credentials are passed at runtime and are neither copied into the image nor included in receipts.
+The agent joins a Docker `--internal` network, which has no direct external route.
+A separate dual-homed CONNECT proxy allowlists only the `chatgpt.com` and
+`openai.com` suffixes used by the documented current ChatGPT/Codex control plane.
+Denied hostnames are logged during real acceptance so the list can be adjusted from
+observed traffic rather than silently widened. Repository workload egress is denied in v1. Setting proxy variables
+is therefore not the boundary: the internal network is. Verification, diff
+accounting, commit creation, and receipts execute on the trusted host after the
+container exits. Push and PR publication are reserved controller extensions;
+merge is never an agent capability.
+
+## Run
+
+Requirements are Git, Docker, Codex CLI 0.150-compatible behavior, and an existing
+host session authenticated by running `codex login` with a ChatGPT account. API keys
+are neither read nor accepted by the canonical launcher.
 
 ```sh
-bin/agent-harness --repo /path/to/project --task 'Fix the failing greeting' \
+bin/agent-harness --repo /path/to/project --task 'Fix the greeting' \
   --branch agent-harness/fix-greeting --output /tmp/harness-run
 ```
 
-The launcher builds `Dockerfile`, clones the target (without modifying the source checkout), creates the requested branch, mounts that working tree at `/workspace`, and writes `/tmp/harness-run/receipt.json`. The completed checkout remains at `/tmp/harness-run/worktree`, ready for normal inspection and push/PR creation. The harness never merges.
+The launcher checks `codex login status`, requires ChatGPT authentication, and stages
+only file-backed `CODEX_HOME/auth.json` plus a generated minimal configuration in a
+mode-0700 per-run directory. It validates that staged home with the installed CLI,
+mounts it read/write for token refresh, and destroys it in cleanup. If the host uses
+the OS keyring, run `codex -c cli_auth_credentials_store=file login` once. It never
+mounts the host home or copies unrelated Codex configuration. There is no agent-writable
+receipt/output mount; the trusted launcher records container execution itself. The generated Codex
+permission profile also denies sandboxed project commands read access to the staged
+control-plane home while allowing the parent Codex runtime to refresh it.
+
+The output retains `worktree/` and `receipt.json`. Authentication and prompt text
+are absent from receipts (only a prompt SHA-256 is retained). The receipt marks
+`acceptance_evidence` true only when a real container started and Codex executed.
+The hidden mock seam is named `--test-agent-command`, emits `mock (TEST_ONLY)`, and
+can never produce acceptance evidence.
 
 ## Repository contract
 
@@ -21,8 +58,8 @@ Consumers commit `.agent-harness.toml`:
 
 ```toml
 [verification]
-fast = ["git diff --check", "make test-unit"]
-terminal = ["make test"]
+fast = ["make test-unit"]
+terminal = ["git diff --check", "make test"]
 
 [policy]
 network = "DENY"
@@ -36,25 +73,59 @@ max_changed_files = 10
 max_diff_lines = 500
 ```
 
-Commands run literally, in order, with exact exit code and duration recorded. Output is forwarded to the run log but deliberately omitted from the receipt, where it might expose secrets. A nonzero gate cannot be reinterpreted. Fast checks run after the single agent turn; terminal checks run only if fast checks pass. Project bootstrap and toolchains belong to the consumer, not the generic image.
+Gate commands are repository-owned and run literally in order. The generic
+harness contains no Ruff, Tach, pytest, Python, or shell-project assumptions.
+Unknown policy actions deny. The classifier guides trusted controller actions;
+container topology—not voluntary classifier use—denies agent authority.
 
-## Policy, budget, and trust
+Wall time, changed files, additions/deletions, and commits are computed externally.
+Hard run/commit exhaustion emits `STOP_BUDGET_EXCEEDED`; diff growth emits
+`REQUIRE_HUMAN_SCOPE_ESCALATION`. Codex cannot waive either result.
 
-The controller's explicit actions return `ALLOW`, `DENY`, or `REQUIRE_HUMAN`; unknown actions fail closed. Defaults deny force-push, merge, destructive Git, out-of-workspace commands and network, and require a human for push and secrets. `codex exec --sandbox workspace-write` mechanically confines the agent invocation to the mounted worktree; Docker receives no network entitlement from repository configuration. The launcher exposes no host workspace beyond the isolated checkout and receipt directory.
+## PR #2 substrate disposition
 
-Wall time is enforced as a subprocess timeout. Model turns and commits are capped, and changed-file/diff-line growth becomes `REQUIRE_HUMAN_SCOPE_ESCALATION`; the agent cannot waive these values. Receipt terminal states make stops explicit. No transcript, prompt, or command output is retained—only a SHA-256 prompt digest and command result metadata.
+| Component | Disposition | Reason |
+|---|---|---|
+| Dockerfile / Codex image | **REPAIR** | Retained minimal base; now unprivileged with a dedicated entrypoint. |
+| `bin/agent-harness` | **REPAIR** | Retained literal launcher; now owns worktree, topology, image identity, and cleanup. |
+| `harness/controller.py` | **REPAIR** | Retained config/gate/receipt substrate; agent execution moved outside trusted finalization. |
+| `.agent-harness.toml` | **KEEP** | Verification/policy/budget vocabulary remains repository-local. |
+| Both fixtures | **KEEP** | Still demonstrate unrelated, repository-defined gates. |
+| `tests/mock_agent.py` | **TEST_ONLY** | Unit seam only and receipt-ineligible for acceptance. |
+| Receipt contract | **REPAIR** | Adds real-container/Codex evidence, exact image identity, and product SHA. |
+| Policy contract | **REPAIR** | Controller decisions retained; denied authority is now mechanically absent. |
+| Budget contract | **REPAIR** | Trusted host measures scope, time, and commits. |
+| PR #2 components removed | **REMOVE: none** | No working substrate required wholesale replacement. |
 
-The receipt also identifies the version, repository/base/branch, timestamps, image metadata when supplied, agent, commits, diff stat, gates, policy decisions, budget use, and terminal status.
+## Trusted Docker acceptance
 
-## Adopting and extending
+The API-key GitHub Actions workflow was removed: it is not authoritative for v1.
+On a trusted Docker-capable host whose Codex CLI is already signed into ChatGPT, run:
 
-Copy the TOML contract into any Git repository and choose commands its own environment supports. `fixtures/python-repo` and the unrelated POSIX-shell `fixtures/shell-repo` demonstrate that no Python/Atlas verification is built into the controller.
+```sh
+bin/trusted-host-acceptance --output /tmp/agent-harness-acceptance
+```
 
-A future agent backend replaces only the one `codex exec` subprocess. A future isolation backend replaces the launcher's Docker invocation. Neither change requires a new work-state store, policy vocabulary, verification file, or receipt contract. Independent review may later attach at the terminal boundary, but must be explicitly bounded by acceptance criteria and threat model; it may not expand scope indefinitely.
+This single command records the exact candidate SHA, builds its image, checks image
+layers/files for auth state, runs mechanical adversaries, runs real Codex against
+both fixtures, verifies receipt fields, and verifies per-run auth cleanup. The host
+must retain the output directory as acceptance evidence. It prints the readiness
+terminal only after both real runs pass; its existence alone is not acceptance.
 
-## Development checks
+### Observed Codex 0.150 authentication contract
+
+Mechanical inspection on 2026-08-27 found `codex-cli 0.150.0`; `codex login` defaults
+to browser-based ChatGPT sign-in, `codex login --device-auth` supports headless login,
+and `codex login status` reports the active method. `CODEX_HOME` is supported and must
+already exist. Current official Codex documentation defines file-backed credentials
+as `CODEX_HOME/auth.json`, permits refresh writes, and warns that the file contains
+access tokens. The harness checks the installed CLI's status both before and after
+staging rather than inferring authentication from file presence.
+
+Development checks:
 
 ```sh
 python3 -m unittest discover -s tests -v
+python3 -m py_compile harness/*.py bin/agent-harness
 docker build -t agent-harness:test .
 ```

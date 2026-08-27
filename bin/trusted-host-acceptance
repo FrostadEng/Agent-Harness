@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Literal Issue #1 acceptance for a ChatGPT-authenticated Docker host."""
+import argparse,json,os,pathlib,shutil,subprocess,sys,tempfile
+ROOT=pathlib.Path(__file__).resolve().parents[1]
+def run(args,**kw):
+ print("+ "+" ".join(map(str,args)),file=sys.stderr); return subprocess.run(list(map(str,args)),check=True,**kw)
+def main():
+ p=argparse.ArgumentParser(); p.add_argument("--codex-home"); p.add_argument("--output"); a=p.parse_args()
+ sha=subprocess.check_output(["git","-C",str(ROOT),"rev-parse","HEAD"],text=True).strip(); image=f"agent-harness:{sha}"
+ source=pathlib.Path(a.codex_home or os.getenv("CODEX_HOME",pathlib.Path.home()/".codex")).expanduser().resolve()
+ run(["codex","--version"]); run(["codex","login","status"],env={**os.environ,"CODEX_HOME":str(source)})
+ auth=json.loads((source/"auth.json").read_text())
+ def strings(value):
+  if isinstance(value,str) and len(value)>=20: yield value
+  elif isinstance(value,dict):
+   for child in value.values(): yield from strings(child)
+  elif isinstance(value,list):
+   for child in value: yield from strings(child)
+ auth_material=tuple(strings(auth))
+ before={str(x) for x in pathlib.Path(tempfile.gettempdir()).glob("agent-harness-auth-*")}
+ root=pathlib.Path(a.output).resolve() if a.output else pathlib.Path(tempfile.mkdtemp(prefix="agent-harness-acceptance-"))
+ root.mkdir(parents=True,exist_ok=True)
+ try:
+  run(["docker","build","--label",f"org.opencontainers.image.revision={sha}","-t",image,ROOT])
+  run(["sh",ROOT/"tests/docker_adversaries.sh",image])
+  history=subprocess.check_output(["docker","history","--no-trunc",image],text=True)
+  if "auth.json" in history or "access_token" in history: raise SystemExit("authentication leaked into image history")
+  probe=subprocess.run(["docker","run","--rm","--entrypoint","sh",image,"-c","find / -name auth.json -print -quit 2>/dev/null"],text=True,capture_output=True,check=True)
+  if probe.stdout.strip(): raise SystemExit("authentication present in built image")
+  for fixture in ("python-repo","shell-repo"):
+   repo=root/(fixture+"-source"); shutil.copytree(ROOT/"fixtures"/fixture,repo)
+   run(["git","-C",repo,"init","-q","-b","main"]); run(["git","-C",repo,"add","."])
+   run(["git","-C",repo,"-c","user.name=Fixture","-c","user.email=f@local","commit","-qm","fixture"])
+   out=root/fixture
+   run([ROOT/"bin/agent-harness","--no-build","--image",image,"--repo",repo,"--codex-home",source,
+        "--branch",f"acceptance/{fixture}-{sha}","--output",out,
+        "--task","Repair the deliberate defect. Change only the intended product file."])
+   receipt=json.loads((out/"receipt.json").read_text())
+   assert receipt["acceptance_evidence"] and receipt["result"]["status"]=="SUCCESS"
+   assert receipt["agent"]["authentication_mode"]=="chatgpt-account" and receipt["result"]["product_sha"]
+   assert receipt["container"]["digest"].startswith("sha256:")
+   for tree in (repo,out):
+    if list(tree.rglob("auth.json")): raise SystemExit(f"authentication leaked into {tree}")
+    for path in tree.rglob("*"):
+     if path.is_file():
+      content=path.read_bytes()
+      if any(secret.encode() in content for secret in auth_material): raise SystemExit(f"credential material leaked into {path}")
+  # Exercise external scope accounting without treating the TEST_ONLY seam as acceptance.
+  scope_repo=root/"scope-source"; shutil.copytree(ROOT/"fixtures/shell-repo",scope_repo)
+  run(["git","-C",scope_repo,"init","-q","-b","main"]); run(["git","-C",scope_repo,"add","."])
+  run(["git","-C",scope_repo,"-c","user.name=Fixture","-c","user.email=f@local","commit","-qm","fixture"])
+  scope_receipt=root/"scope-receipt.json"
+  stopped=subprocess.run([sys.executable,ROOT/"harness/controller.py","--repo",scope_repo,"--receipt",scope_receipt,
+    "--task","scope adversary","--test-agent-command","touch one two three"])
+  if stopped.returncode==0 or json.loads(scope_receipt.read_text())["result"]["status"]!="REQUIRE_HUMAN_SCOPE_ESCALATION":
+   raise SystemExit("scope budget adversary was not stopped")
+  after={str(x) for x in pathlib.Path(tempfile.gettempdir()).glob("agent-harness-auth-*")}
+  if after-before: raise SystemExit(f"authentication staging not cleaned: {after-before}")
+  print(json.dumps({"status":"PORTABLE_CODEX_HARNESS_V1_READY","candidate_sha":sha,"image":image,"receipts":str(root)}))
+ finally:
+  pass
+ return 0
+if __name__=="__main__": sys.exit(main())
